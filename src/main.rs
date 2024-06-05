@@ -1,106 +1,71 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+mod loader;
+mod terminal_ui;
 
 use anyhow::Result;
 use clap::Parser;
-use section::{
-    dummy::DummySectionChannel, futures::{self, Sink, Stream}, message::Message, section::Section, SectionError, SectionFuture, SectionMessage
-};
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::PollSender;
+use loader::{loader, Stat};
+use std::sync::Arc;
+use terminal_ui::start_terminal;
+use tokio::{sync::mpsc::UnboundedSender, task::JoinSet};
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[clap(short, long, default_value = "512")]
+    #[clap(short, long, default_value = "512", env = "BATCH_SIZE")]
     batch_size: usize,
-    #[clap(short, long, default_value = "postgres://root:root@127.0.0.1:5432/postgres")]
+    #[clap(
+        short,
+        long,
+        default_value = "postgres://root:root@127.0.0.1:5432/postgres",
+        env = "DATABASE_URL"
+    )]
     connection_string: String,
-    #[clap(short, long, default_value = "PUBLIC")]
+    #[clap(short, long, default_value = "public", env = "DATABASE_SCHEMA")]
     schema: String,
+    #[clap(short, long, default_value = "1", env = "NUM_LOADERS")]
+    num_loaders: usize,
+    #[clap(short, long, default_value = "metrics", env = "ORIGIN")]
+    origin: String,
+    #[clap(long, default_value=None, env = "NUM_CHUNKS")]
+    num_chunks: Option<usize>,
 }
 
-struct XorShift {
-    state: u64,
-}
-
-impl XorShift {
-    fn new(state: u64) -> Self {
-        Self {
-            state: state.max(1),
-        }
-    }
-
-    fn next(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 17;
-        self.state ^= self.state << 5;
-        self.state
-    }
-}
-
-
-#[derive(Debug)]
-struct Msg {
-    inner: Option<Df>
-}
-
-impl Msg {
-    fn new(rng: &mut XorShift, batch_size: usize) -> Self {
-        Self { inner: Some(Df::new(rng, batch_size)) }
-    }
-}
-
-impl Message for Msg {
-    fn ack(&mut self) -> section::message::Ack {
-        Box::pin(async move {})
-    }
-
-    fn next(&mut self) -> section::message::Next<'_> {
-        let payload = Ok(self.inner.take());
-        Box::pin(async move {
-            payload
+fn start_loaders(cli: Cli, tx: UnboundedSender<Stat>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .block_on(&rt, async move {
+            let connection_string = Arc::from(cli.connection_string);
+            let origin = Arc::from(cli.origin);
+            let schema = Arc::from(cli.schema);
+            let mut handles = (0..cli.num_loaders)
+                .map(|id| {
+                    tokio::spawn(loader(
+                        id,
+                        Arc::clone(&connection_string),
+                        Arc::clone(&schema),
+                        Arc::clone(&origin),
+                        cli.batch_size,
+                        cli.num_chunks,
+                        tx.clone(),
+                    ))
+                })
+                .collect::<JoinSet<_>>();
+            drop(tx);
+            while let Some(res) = handles.join_next().await {
+                let _ok = res?;
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(())
         })
-    }
-
-    fn origin(&self) -> &str {
-        "payload_gen"
-    }
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok(())
 }
 
-#[derive(Debug)]
-struct Df {}
-
-impl Df {
-    fn new(rng: &mut XorShift, batch_size: usize) -> Self {
-        Self {}
-    }
-}
-
-#[derive(Debug)]
-struct PayloadGen {}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+fn main() -> Result<()> {
+    //tracing_subscriber::fmt().with_ansi(false).init();
     let cli = Cli::parse();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let mut rng = XorShift::new(now.as_secs());
-    tracing::info!("cli: {:?}", cli);
-
-    let postgres_dst = postgres_connector::destination::Postgres::new(
-        &cli.connection_string,
-        &cli.schema,
-        false
-    );
-
-    let pg_handle = tokio::spawn(postgres_dst.start(
-        stub::Stub::<SectionMessage, SectionError>::new(),
-        stub::Stub::new(),
-        DummySectionChannel::new()
-    ));
-
-    pg_handle.await?.map_err(|e| anyhow::anyhow!(e))?;
-    tracing::info!("done");
-
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = std::thread::spawn(move || start_loaders(cli, tx));
+    start_terminal(rx).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let _ = handle.join().map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(())
 }
